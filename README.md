@@ -53,11 +53,15 @@ Below are some generic instructions for how to compile xfce-superkey from source
 Usage
 -----
 
-    $ xfce-superkey [-d] [-t <timeout ms>]
+    $ xfce-superkey [-d] [-t <timeout ms>] [-c <command>]
 
 `-d`
 
 Debug mode. Does not fork into the background.
+
+`-c <command>`
+
+Execute a custom command instead of the default `xfce4-popup-whiskermenu`.
 
 `-t <timeout ms>`
 
@@ -72,6 +76,11 @@ menu. Default is 500 ms.
 Makes left Super key to execute `xfce4-popup-whiskermenu` when pressed and
 released on its own (does not affect existing keyboard combinations using the
 Super key).
+
+    xfce-superkey -c "xfdashboard"
+
+Makes left Super key to execute `xfdashboard` when pressed and
+released on its own.
 
 
 Note regarding xmodmap (may not relate to `xfce-superkey`)

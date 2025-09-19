@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <errno.h>
+#include <sys/wait.h>
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
 #include <X11/extensions/record.h>
@@ -68,11 +69,21 @@ typedef struct _XCape_t
     Key_t *generated;
     struct timeval timeout;
     Bool timeout_valid;
+    char *command;
+    char **command_args;
 } XCape_t;
 
 /************************************************************************
  * Internal function declarations
  ***********************************************************************/
+int validate_command(const char *cmd);
+
+char **parse_command_args(const char *cmd);
+
+void free_command_args(char **args);
+
+int secure_execute_command(char **args, Bool debug);
+
 void *sig_handler (void *user_data);
 
 void intercept (XPointer user_data, XRecordInterceptData *data);
@@ -107,11 +118,13 @@ int main (int argc, char **argv)
     self->timeout.tv_usec = 500000;
     self->timeout_valid = True;
     self->generated = NULL;
+    self->command = "xfce4-popup-whiskermenu";
+    self->command_args = NULL;
 
     rec_range->device_events.first = KeyPress;
     rec_range->device_events.last = ButtonRelease;
 
-    while ((ch = getopt (argc, argv, "d:t:")) != -1)
+    while ((ch = getopt (argc, argv, "dt:c:")) != -1)
     {
         switch (ch)
         {
@@ -133,9 +146,30 @@ int main (int argc, char **argv)
                 }
             }
             break;
+        case 'c':
+            if (validate_command(optarg) != 0) {
+                fprintf(stderr, "Invalid command: %s\n", optarg);
+                return EXIT_FAILURE;
+            }
+            self->command = strdup(optarg);
+            if (!self->command) {
+                perror("strdup");
+                return EXIT_FAILURE;
+            }
+            self->command_args = parse_command_args(optarg);
+            break;
         default:
             print_usage (argv[0]);
             return EXIT_SUCCESS;
+        }
+    }
+
+    if (self->debug) {
+        fprintf(stdout, "Command to execute: %s\n", self->command);
+        if (self->command_args) {
+            for (int i = 0; self->command_args[i]; i++) {
+                fprintf(stdout, "  arg[%d]: %s\n", i, self->command_args[i]);
+            }
         }
     }
 
@@ -229,6 +263,13 @@ int main (int argc, char **argv)
     XCloseDisplay (self->ctrl_conn);
     XCloseDisplay (self->data_conn);
 
+    if (self->command_args != NULL) {
+        free_command_args(self->command_args);
+    }
+    if (self->command != NULL && strcmp(self->command, "xfce4-popup-whiskermenu") != 0) {
+        free(self->command);
+    }
+
     delete_mapping (self->map);
 
     free (self);
@@ -321,7 +362,13 @@ void handle_key (XCape_t *self, KeyMap_t *key,
 
             if (!self->timeout_valid || timercmp (&timev, &self->timeout, <))
             {
-                system("xfce4-popup-whiskermenu");
+                if (self->command_args != NULL) {
+                    secure_execute_command(self->command_args, self->debug);
+                } else {
+                    /* Fallback to default */
+                    char *default_args[] = {"xfce4-popup-whiskermenu", NULL};
+                    secure_execute_command(default_args, self->debug);
+                }
             }
         }
         key->used = False;
@@ -550,6 +597,79 @@ void delete_keys (Key_t *keys)
 
 void print_usage (const char *program_name)
 {
-    fprintf (stdout, "Usage: %s [-d] [-t timeout_ms] [-e <mapping>]\n", program_name);
+    fprintf (stdout, "Usage: %s [-d] [-t timeout_ms] [-c <command>]\n", program_name);
+    fprintf (stdout, "  -d              Enable debug mode\n");
+    fprintf (stdout, "  -t timeout_ms   Set key timeout in milliseconds\n");
+    fprintf (stdout, "  -c <command>    Command to execute (default: xfce4-popup-whiskermenu)\n");
     fprintf (stdout, "Runs as a daemon unless -d flag is set\n");
 }
+
+int validate_command(const char *cmd) {
+    if (strlen(cmd) > 512) {
+        fprintf(stderr, "Command exceeds maximum length of 512 characters.\n");
+        return -1;
+    }
+    if (strstr(cmd, "../") != NULL) {
+        fprintf(stderr, "Path traversal detected in command.\n");
+        return -1;
+    }
+    const char *whitelist = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_. /";
+    for (size_t i = 0; i < strlen(cmd); i++) {
+        if (strchr(whitelist, cmd[i]) == NULL) {
+            fprintf(stderr, "Invalid character in command: %c\n", cmd[i]);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+char **parse_command_args(const char *cmd) {
+    int argc = 0;
+    char **argv = malloc(33 * sizeof(char *)); /* Max 32 args + NULL */
+    if (!argv) return NULL;
+
+    char *cmd_copy = strdup(cmd);
+    if (!cmd_copy) {
+        free(argv);
+        return NULL;
+    }
+
+    char *token = strtok(cmd_copy, " ");
+    while (token != NULL && argc < 32) {
+        argv[argc++] = strdup(token);
+        token = strtok(NULL, " ");
+    }
+    argv[argc] = NULL;
+
+    free(cmd_copy);
+    return argv;
+}
+
+void free_command_args(char **args) {
+    if (!args) return;
+    for (int i = 0; args[i] != NULL; i++) {
+        free(args[i]);
+    }
+    free(args);
+}
+
+int secure_execute_command(char **args, Bool debug) {
+    if (!args || !args[0]) {
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        if (debug) perror("fork");
+        return -1;
+    } else if (pid == 0) { /* Child process */
+        execvp(args[0], args);
+        /* If execvp returns, an error occurred */
+        fprintf(stderr, "Failed to execute command '%s': %s\n", args[0], strerror(errno));
+        exit(EXIT_FAILURE);
+    } else { /* Parent process */
+        if (debug) fprintf(stdout, "Executed command: %s (PID: %d)\n", args[0], pid);
+    }
+    return 0;
+}
+
